@@ -1,36 +1,85 @@
-name: CI
+# .github/workflows/ci.yml
+name: Build & Push Docker Image to ACR & Deploy to Azure Container App
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches: [ main ] # Or your default branch (e.g., master)
+  workflow_dispatch: # Allows manual triggering
+
+env:
+  AZURE_RESOURCE_GROUP: Rg-mcp
+  AZURE_CONTAINER_REGISTRY_NAME: Acrmcps # Just the name, not the full login server
+  AZURE_CONTAINER_REGISTRY_LOGIN_SERVER: Acrmcps.azurecr.io # Full login server
+  AZURE_CONTAINER_APP_ENV: Env-mcp
+  # IMAGE_NAME_SLUG will be derived from the repository name, e.g., github-mcp-server
+  TARGET_PORT_FOR_THIS_APP: "3000" # <-- !!! SET THIS PER REPOSITORY !!!
 
 jobs:
-  build-and-test:
+  build_and_deploy:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [18.x]
+    # Set an environment variable for the target port based on the repo or a default
+    # This is a bit more advanced; simpler to hardcode TARGET_PORT_FOR_THIS_APP in env block above per repo
+    environment:
+      # You can define different environments in GitHub settings if needed,
+      # but for now, we'll rely on setting TARGET_PORT_FOR_THIS_APP above.
+      name: azure_deployment
 
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v3
+    - name: Checkout repository
+      uses: actions/checkout@v4 # Updated to v4
+
+    - name: Set Target Port (Example - customize or set directly in top env block)
+      run: |
+        REPO_NAME="${{ github.event.repository.name }}"
+        TARGET_PORT="3000" # Default port
+        if [ "$REPO_NAME" == "some-specific-repo-that-uses-port-8080" ]; then
+          TARGET_PORT="8080"
+        elif [ "$REPO_NAME" == "another-repo-on-port-5000" ]; then
+          TARGET_PORT="5000"
+        fi
+        echo "TARGET_PORT_FOR_THIS_APP=$TARGET_PORT" >> $GITHUB_ENV
+      # !!! IMPORTANT: For simplicity, it's easier to just set
+      # TARGET_PORT_FOR_THIS_APP directly in the main 'env:' block at the top
+      # of this file, customized for each repository where you place this ci.yml.
+      # Remove or adapt this step if you set it globally at the top.
+
+    - name: Azure Login
+      uses: azure/login@v1
       with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
-    
-    - name: Install dependencies
-      run: npm ci
-    
-    - name: Build
-      run: npm run build
-    
-    - name: Lint
-      run: npm run lint
-    
-    - name: Check formatting
-      run: npm run format:check
+        creds: ${{ secrets.AZURE_CREDENTIALS }} # Store Azure service principal creds in GitHub secrets
+
+    - name: ACR Login
+      run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY_NAME }}
+
+    - name: Build and push Docker image to ACR
+      id: build-image
+      run: |
+        IMAGE_NAME_SLUG=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+        IMAGE_TAG="${{ env.AZURE_CONTAINER_REGISTRY_LOGIN_SERVER }}/${IMAGE_NAME_SLUG}:${{ github.sha }}"
+        docker build . -t $IMAGE_TAG -f Dockerfile # Assuming Dockerfile is at the root
+        docker push $IMAGE_TAG
+        echo "IMAGE_NAME_WITH_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "CONTAINER_APP_NAME=mcp-${IMAGE_NAME_SLUG}" >> $GITHUB_ENV
+
+    - name: Deploy to Azure Container App
+      run: |
+        echo "Deploying with TARGET_PORT: ${{ env.TARGET_PORT_FOR_THIS_APP }}"
+        az containerapp up \
+          --name ${{ env.CONTAINER_APP_NAME }} \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --environment ${{ env.AZURE_CONTAINER_APP_ENV }} \
+          --image ${{ env.IMAGE_NAME_WITH_TAG }} \
+          --target-port ${{ env.TARGET_PORT_FOR_THIS_APP }} \
+          --ingress external \
+          --min-replicas 1 \
+          --cpu 0.50 \
+          --memory 1.0Gi
+        # For subsequent updates to add Key Vault secrets:
+        # 1. Manually enable Managed Identity on the Container App in Azure Portal.
+        # 2. Grant MI access to secrets in Kv-mcppndsvcs.
+        # 3. Add/Update secrets config in Container App, e.g.:
+        #    az containerapp secret set --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+        #      --secrets "my-secret-name-in-app=@Microsoft.KeyVault(VaultName=Kv-mcppndsvcs;SecretName=actual-secret-name-in-kv)"
+        #    az containerapp update --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+        #      --set-env-vars "MY_ENV_VAR_FOR_SECRET=secretref:my-secret-name-in-app"
+        # This part is typically done once after the first deployment, or via a more sophisticated script.
